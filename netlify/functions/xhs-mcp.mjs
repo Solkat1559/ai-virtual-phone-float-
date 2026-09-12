@@ -32,9 +32,16 @@
  *               放在 Netlify 环境变量里，不进浏览器、不进备份、模型看不到。
  *   MCP_KEY     可选。设了就要求请求带 Authorization: Bearer <MCP_KEY>。
  *
+ * 自检（出问题时先看这里，不用 F12、不用控制台、手机也能看）
+ *   浏览器地址栏打开：<函数地址>?check=1
+ *   页面会用大白话告诉你：cookie 配没配、多长、缺哪个字段、小红书原话是什么、
+ *   下一步该怎么改。设了 MCP_KEY 时需要在末尾追加 &key=<MCP_KEY>。
+ *   想要机读格式就加 &format=json。
+ *
  * 安全提醒
  *   这个 endpoint 是公开可访问的（Netlify 函数默认如此）。知道 URL 的人如果
  *   同时知道你的站点，就能调用它来操作你的小红书账号。强烈建议设置 MCP_KEY。
+ *   ?check=1 页面本身不回显 cookie 的值，只会报告长度和字段名。
  *
  * ============================================================================
  */
@@ -1607,7 +1614,7 @@ const XHSLite = (() => {
 //  MCP 客户端（lib/tool-executor.ts）自动发现与调用。
 // ============================================================================
 
-const SERVER_INFO = { name: "xhs-mcp", version: "1.1.0" };
+const SERVER_INFO = { name: "xhs-mcp", version: "1.2.0" };
 // 客户端会把单次工具结果截到 2000 字符，这里主动压到 1800 以内，保证不丢尾巴。
 const MAX_TEXT = 1800;
 
@@ -1793,6 +1800,61 @@ function rpcError(id, code, message, data) {
     });
 }
 
+function clipText(text) {
+    return text.length > MAX_TEXT ? text.slice(0, MAX_TEXT - 20) + "…（已截断）" : text;
+}
+
+// ── cookie 体检（只报告长度与字段名，永不回显 cookie 的值）────────────────────
+// 目的是把「小红书不认这串 cookie」拆成可操作的具体原因：
+// 是没配、被截断、带了 Cookie: 前缀、被引号包住、还是根本没有 web_session。
+
+const COOKIE_KEY_FIELDS = ["a1", "web_session", "webId", "gid", "xsecappid"];
+
+function inspectCookie(raw) {
+    const value = typeof raw === "string" ? raw : "";
+    const trimmed = value.trim();
+    const names = [];
+    for (const part of trimmed.split(";")) {
+        const i = part.indexOf("=");
+        if (i > 0) names.push(part.slice(0, i).trim());
+    }
+    const set = new Set(names);
+    return {
+        present: trimmed.length > 0,
+        length: trimmed.length,
+        raw_length: value.length,
+        field_count: names.length,
+        fields_head: names.slice(0, 6),
+        has_a1: set.has("a1"),
+        has_web_session: set.has("web_session"),
+        missing_key_fields: COOKIE_KEY_FIELDS.filter(f => !set.has(f)),
+        starts_with_cookie_prefix: /^\s*cookie\s*:/i.test(trimmed),
+        wrapped_in_quotes: trimmed.length > 1 && /^["'`]/.test(trimmed) && /["'`]$/.test(trimmed),
+        has_newline: /[\r\n]/.test(value),
+        has_padding_space: value !== trimmed,
+        // 正常的小红书 cookie 有一千多字符；明显偏短通常是复制/粘贴被截断。
+        looks_truncated: trimmed.length > 0 && trimmed.length < 300,
+    };
+}
+
+function diagnoseCookie(c) {
+    if (!c || !c.present) {
+        return ["环境变量 XHS_COOKIE 是空的。到 Netlify 的 Environment variables 填上完整 cookie，然后重新部署一次。"];
+    }
+    const notes = [];
+    if (c.starts_with_cookie_prefix) notes.push("值里带上了 `Cookie: ` 前缀。环境变量只填冒号后面的那串，把 `Cookie: ` 删掉。");
+    if (c.wrapped_in_quotes) notes.push("值被引号包住了（首尾是引号）。把引号删掉，只留中间的内容。");
+    if (c.has_newline) notes.push("值里含有换行符。复制时带进了折行，重新复制成一行再粘。");
+    if (c.has_padding_space) notes.push("值的首尾有多余空格，建议删掉。");
+    if (!c.has_a1) notes.push("缺少 a1= 字段，说明 cookie 复制得不完整。");
+    if (!c.has_web_session) notes.push("缺少 web_session= —— 这个字段才代表「已登录」。多半是扫码后没在手机上点「确认登录」，或者复制到了登录之前的旧请求。");
+    if (c.looks_truncated) notes.push(`值只有 ${c.length} 字符（正常一千多），像是被截断了，重新复制一整行。`);
+    if (!notes.length) {
+        notes.push("cookie 的结构看着正常（a1= 和 web_session= 都在），但小红书仍然不认。最可能是这串 cookie 已经失效或过期，重新扫码复制一次。");
+    }
+    return notes;
+}
+
 // ── 结果渲染（压到 MAX_TEXT 以内）────────────────────────────────────────────
 
 function clipLines(header, lines, footer) {
@@ -1916,20 +1978,45 @@ function renderAction(payload, okText) {
     return { text, isError: false };
 }
 
-function renderCheckLogin(payload) {
+function renderCheckLogin(payload, cookieDiag) {
     const p = payload || {};
     if (p.error) return { text: p.error, isError: true };
     const ok = p.success !== false && (p.nickname || p.user_id || p.userId || p.logged_in);
-    if (!ok) return { text: `登录态看起来无效：${oneLine(JSON.stringify(p), 300)}`, isError: true };
     const name = p.nickname || p.nick_name || "";
     const uid = p.user_id || p.userId || "";
-    return { text: `登录有效${name ? `，账号：${name}` : ""}${uid ? ` (${uid})` : ""}${p.platform ? `，后端：${p.platform}` : ""}`, isError: false };
+    if (ok) {
+        return {
+            text: `登录有效${name ? `，账号：${name}` : ""}${uid ? ` (${uid})` : ""}`
+                + `${p.platform ? `，后端：${p.platform}` : ""}${p.api_host ? `，接口：${p.api_host}` : ""}`,
+            isError: false,
+        };
+    }
+    // 失败时给出可操作的原因，而不是把原始 JSON 甩给模型去猜。
+    const lines = ["小红书没有认这串 cookie。"];
+    if (p.api_host) lines.push(`· 请求打到了：${p.api_host}${p.platform ? `（${p.platform}）` : ""}`);
+    if (p.checked_platforms) lines.push(`· 试过的后端：${[].concat(p.checked_platforms).join("、")}`);
+    if (cookieDiag) {
+        lines.push(
+            `· 服务器上的 cookie：${cookieDiag.length} 字符 / ${cookieDiag.field_count} 个字段`
+            + `（${cookieDiag.missing_key_fields.length ? `缺 ${cookieDiag.missing_key_fields.join("、")}` : "关键字段齐全"}）`,
+        );
+    }
+    const raw = p.raw || {};
+    const bits = [];
+    if (raw.success !== undefined) bits.push(`success=${raw.success}`);
+    if (raw.code !== undefined) bits.push(`code=${raw.code}`);
+    if (raw.msg) bits.push(`msg=${oneLine(raw.msg, 80)}`);
+    if (bits.length) lines.push(`· 小红书原话：${bits.join("  ")}`);
+    const notes = cookieDiag ? diagnoseCookie(cookieDiag) : [];
+    if (notes.length) lines.push(`· 最可能的原因：${notes[0]}`);
+    lines.push("· 详细体检：在浏览器地址栏打开本函数的地址，末尾加 ?check=1");
+    return { text: clipText(lines.join("\n")), isError: true };
 }
 
-function renderToolResult(toolName, payload) {
+function renderToolResult(toolName, payload, ctx) {
     switch (toolName) {
         case "xhs_check_login":
-            return renderCheckLogin(payload);
+            return renderCheckLogin(payload, ctx && ctx.cookieDiag);
         case "xhs_search":
             return { text: renderNotes(payload, "搜索结果"), isError: false };
         case "xhs_list_feeds":
@@ -2021,7 +2108,7 @@ async function handleRpc(msg, env) {
 
         try {
             const payload = await callCore(tool.command, tool.build(args), env);
-            const rendered = renderToolResult(name, payload);
+            const rendered = renderToolResult(name, payload, { cookieDiag: inspectCookie(env && env.XHS_COOKIE) });
             return rpcResult(id, {
                 content: [{ type: "text", text: rendered.text }],
                 ...(rendered.isError ? { isError: true } : {}),
@@ -2038,6 +2125,197 @@ async function handleRpc(msg, env) {
     return rpcError(id, -32601, `Method not found: ${method}`);
 }
 
+// ── 体检页：浏览器打开 <函数地址>?check=1 ────────────────────────────────────
+// 这一步不需要 F12、不需要控制台、不需要装任何东西；手机上也能看。
+// 它会真的去问一次小红书「我是谁」，然后把结论用大白话写在页面上。
+
+function escapeHtml(s) {
+    return String(s == null ? "" : s)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+}
+
+function htmlPage(body, status = 200) {
+    return new Response(body, {
+        status,
+        headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store", ...CORS_HEADERS },
+    });
+}
+
+function diagPageHtml({ level, title, verdict, reasons, next, details, raw }) {
+    const palette = level === "ok"
+        ? { fg: "#0f7b3f", bg: "#e7f6ec", icon: "✅" }
+        : level === "warn"
+            ? { fg: "#a35b00", bg: "#fdf5e3", icon: "⚠️" }
+            : { fg: "#c0271f", bg: "#fdeceb", icon: "❌" };
+    const li = arr => (arr || []).map(x => `<li>${escapeHtml(x)}</li>`).join("");
+    const rows = (details || []).map(([k, v]) => `<tr><td>${escapeHtml(k)}</td><td>${escapeHtml(v)}</td></tr>`).join("");
+    return `<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>小红书 MCP 体检</title>
+<style>
+:root{color-scheme:light}
+body{margin:0;padding:16px 14px 40px;background:#f5f6f8;color:#1f2328;
+font:16px/1.75 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif}
+.card{max-width:720px;margin:0 auto 14px;background:#fff;border:1px solid #e4e7ec;border-radius:14px;padding:16px 18px}
+.banner{background:${palette.bg};border-color:${palette.fg}}
+h1{font-size:18px;margin:0 0 10px}
+h2{font-size:14px;margin:0 0 8px;color:#5b6472;font-weight:600;letter-spacing:.02em}
+.status{color:${palette.fg};font-size:18px;font-weight:700;line-height:1.5}
+.verdict{margin:10px 0 0;color:#3a4250}
+ol,ul{margin:0;padding-left:22px}
+li{margin:5px 0}
+table{width:100%;border-collapse:collapse;font-size:14px}
+td{padding:7px 2px;border-bottom:1px solid #eef0f3;vertical-align:top;word-break:break-all}
+tr:last-child td{border-bottom:none}
+td:first-child{color:#5b6472;width:42%;white-space:nowrap}
+pre{background:#f6f8fa;border:1px solid #e4e7ec;border-radius:8px;padding:10px;margin:0;
+overflow-x:auto;font:12px/1.6 ui-monospace,Consolas,monospace;white-space:pre-wrap;word-break:break-all}
+.next{background:#eef3ff;border-color:#c9d8ff}
+.foot{max-width:720px;margin:0 auto;color:#8b93a1;font-size:12px;text-align:center}
+</style></head><body>
+<div class="card banner">
+  <h1>${palette.icon} 小红书 MCP 体检</h1>
+  <div class="status">${escapeHtml(title)}</div>
+  ${verdict ? `<p class="verdict">${escapeHtml(verdict)}</p>` : ""}
+</div>
+<div class="card"><h2>诊断依据</h2><ul>${li(reasons)}</ul></div>
+${(next && next.length) ? `<div class="card next"><h2>下一步怎么做</h2><ol>${li(next)}</ol></div>` : ""}
+<div class="card"><h2>详细数据</h2><table>${rows}</table></div>
+${raw ? `<div class="card"><h2>小红书返回的原始内容</h2><pre>${escapeHtml(raw)}</pre></div>` : ""}
+<p class="foot">xhs-mcp ${escapeHtml(SERVER_INFO.version)} · 刷新本页可重新体检</p>
+</body></html>`;
+}
+
+async function handleDiagnostics(url, env, request) {
+    const started = Date.now();
+
+    // 设了 MCP_KEY 时，体检页也要带钥匙，避免站点公开后被人拿去看账号信息。
+    if (env && env.MCP_KEY) {
+        const supplied = url.searchParams.get("key") || "";
+        const auth = request.headers.get("Authorization") || "";
+        if (supplied !== env.MCP_KEY && auth !== `Bearer ${env.MCP_KEY}`) {
+            return json({
+                error: "体检页需要密钥。",
+                hint: "在本网址末尾追加 &key=<你的 MCP_KEY>，例如 .../xhs-mcp?check=1&key=abcd1234",
+            }, 401);
+        }
+    }
+
+    const diag = inspectCookie(env && env.XHS_COOKIE);
+    const notes = diagnoseCookie(diag);
+
+    let login = null;
+    let thrown = "";
+    try {
+        login = await callCore("check-login", {}, env);
+    } catch (err) {
+        thrown = err instanceof Error ? err.message : String(err);
+    }
+    const elapsed = Date.now() - started;
+
+    let level = "bad";
+    let title = "";
+    let verdict = "";
+    let reasons = [];
+    let next = [];
+
+    if (thrown) {
+        level = "bad";
+        title = "函数自己报错了，还没碰到小红书";
+        verdict = thrown;
+        reasons = [thrown];
+        next = [
+            "把这段原文发给我，我来改。",
+            "如果你刚改过环境变量，确认已经重新部署（Deploys → Trigger deploy → Deploy site）。",
+        ];
+    } else if (login && login.error) {
+        level = "bad";
+        title = "小红书两套后端都没有接受这串 cookie";
+        verdict = login.error;
+        reasons = [login.error, ...(login.checked_platforms ? [`已尝试的后端：${[].concat(login.checked_platforms).join("、")}`] : [])];
+        next = notes;
+    } else if (login && login.logged_in) {
+        level = "ok";
+        title = `登录有效${login.nickname ? `，账号：${login.nickname}` : ""}`;
+        verdict = "cookie 是好的，整条链路是通的。如果 AI 还说「未登录」，那是角色根本没调用工具、在随口编。";
+        reasons = [
+            `成功请求到 ${login.api_host || "小红书"}，并被接受。`,
+            login.user_id ? `账号 ID：${login.user_id}` : "已拿到登录态。",
+        ];
+        next = [];
+    } else {
+        level = "bad";
+        title = "cookie 没通过小红书的登录校验";
+        verdict = "小红书明确回复：没有登录信息。";
+        reasons = [
+            "已分别向 xiaohongshu.com 和 rednote.com 两套后端发过请求，两边都不认这串 cookie。",
+            ...notes,
+        ];
+        next = [
+            "按上面第一条提示去改，多半是重新复制一次 cookie。",
+            "改完务必重新部署：Deploys → Trigger deploy → Deploy site。",
+            "然后刷新本页面，看到绿色「登录有效」就成了。",
+        ];
+    }
+
+    const rawText = login && login.raw
+        ? JSON.stringify(login.raw).slice(0, 1200)
+        : (thrown || "");
+
+    if (url.searchParams.get("format") === "json") {
+        return json({
+            level,
+            title,
+            verdict,
+            reasons,
+            elapsed_ms: elapsed,
+            server: SERVER_INFO,
+            endpoint: url.origin + url.pathname,
+            cookie: diag,
+            login: login
+                ? {
+                    logged_in: !!login.logged_in,
+                    nickname: login.nickname || "",
+                    user_id: login.user_id || "",
+                    platform: login.platform || "",
+                    api_host: login.api_host || "",
+                    checked_platforms: login.checked_platforms || undefined,
+                }
+                : null,
+            error_thrown: thrown || undefined,
+            mcp_key_set: !!(env && env.MCP_KEY),
+            raw: rawText || undefined,
+        });
+    }
+
+    const details = [
+        ["站点", url.origin],
+        ["函数路径", url.pathname],
+        ["版本", SERVER_INFO.version],
+        ["体检时间", new Date().toISOString()],
+        ["耗时", `${elapsed} ms`],
+        ["XHS_COOKIE", diag.present ? `已配置，${diag.length} 字符` : "没有配置"],
+        ["cookie 字段数", String(diag.field_count)],
+        ["含 a1=", diag.has_a1 ? "是" : "否"],
+        ["含 web_session=", diag.has_web_session ? "是" : "否"],
+        ["缺失的关键字段", diag.missing_key_fields.length ? diag.missing_key_fields.join("、") : "无"],
+        ["疑似被截断", diag.looks_truncated ? "是" : "否"],
+        ["开头带 Cookie: 前缀", diag.starts_with_cookie_prefix ? "是（需要删掉）" : "否"],
+        ["被引号包住", diag.wrapped_in_quotes ? "是（需要删掉）" : "否"],
+        ["值里含换行", diag.has_newline ? "是（需要重新复制成一行）" : "否"],
+        ["MCP_KEY", (env && env.MCP_KEY) ? "已设置" : "未设置（站点若公开，任何人可调用）"],
+        ["登录态", (login && login.logged_in) ? "有效" : "无效"],
+        ["最后尝试的接口", (login && login.api_host) || "（还没走到网络请求这一步）"],
+    ];
+
+    return htmlPage(diagPageHtml({ level, title, verdict, reasons, next, details, raw: rawText }));
+}
+
 // ── Netlify Function 入口 ───────────────────────────────────────────────────
 
 export default async function handler(request, context) {
@@ -2049,7 +2327,11 @@ export default async function handler(request, context) {
     }
 
     // 探活：浏览器直接打开这个地址能看到的页面，用来确认部署成功。
+    // 加 ?check=1 就是完整体检：cookie 是死是活、缺哪个字段、小红书原话。
     if (request.method === "GET") {
+        if (url.searchParams.get("check")) {
+            return await handleDiagnostics(url, env, request);
+        }
         return json({
             status: "ok",
             server: SERVER_INFO,
@@ -2058,6 +2340,7 @@ export default async function handler(request, context) {
             cookie_configured: !!(env && env.XHS_COOKIE),
             auth_required: !!(env && env.MCP_KEY),
             mcp_endpoint: url.origin + url.pathname,
+            diagnostics: url.origin + url.pathname + "?check=1",
             hint: "把这个地址填进 ai-virtual-phone 的设置 -> 工具(MCP) -> 服务器 URL",
         });
     }
